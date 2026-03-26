@@ -1,0 +1,3 @@
+cluster: k3d-koshee-cf-operator
+kubeconfig: ~/.kube/config
+type: k3d-dev

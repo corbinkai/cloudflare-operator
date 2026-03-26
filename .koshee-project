@@ -1,0 +1,9 @@
+project: cloudflare-operator
+portBase: 16000
+clusterName: koshee-cf-operator
+registryName: koshee-cf-operator-registry.localhost
+tunnelPrefix: local-cf-operator
+uptrace:
+  endpoint: http://k3d-koshee-infra-server-0:9317
+  httpEndpoint: http://k3d-koshee-infra-server-0:9319
+  dsn: "http://cf_operator_secret@k3d-koshee-infra-server-0:9319/8"
