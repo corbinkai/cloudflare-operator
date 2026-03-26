@@ -21,14 +21,18 @@ import (
 
 	"github.com/adyanth/cloudflare-operator/internal/clients/cf"
 
+	networkingv1alpha1 "github.com/adyanth/cloudflare-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	networkingv1alpha2 "github.com/adyanth/cloudflare-operator/api/v1alpha2"
 	"github.com/go-logr/logr"
@@ -172,6 +176,13 @@ func (r *ClusterTunnelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return res, err
 	}
 
+	// Rebuild configmap ingress rules from current TunnelBindings.
+	// This handles the case where a TunnelBinding was deleted and the watch triggered this reconcile.
+	if err := rebuildTunnelConfig(r); err != nil {
+		r.log.Error(err, "unable to rebuild tunnel config from bindings")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -183,5 +194,20 @@ func (r *ClusterTunnelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
 		Owns(&appsv1.Deployment{}).
+		Watches(
+			&networkingv1alpha1.TunnelBinding{},
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+				labels := obj.GetLabels()
+				tunnelName := labels[tunnelNameLabel]
+				if tunnelName == "" || labels[tunnelKindLabel] != "ClusterTunnel" {
+					return nil
+				}
+				return []reconcile.Request{{
+					NamespacedName: apitypes.NamespacedName{
+						Name: tunnelName,
+					},
+				}}
+			}),
+		).
 		Complete(r)
 }

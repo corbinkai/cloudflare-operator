@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/adyanth/cloudflare-operator/internal/clients/cf"
 	"github.com/adyanth/cloudflare-operator/internal/clients/k8s"
 
+	networkingv1alpha1 "github.com/adyanth/cloudflare-operator/api/v1alpha1"
 	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -270,6 +273,137 @@ func createManagedResources(r GenericTunnelReconciler) (ctrl.Result, error) {
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// rebuildTunnelConfig rebuilds the cloudflared ConfigMap ingress rules from all current TunnelBindings.
+// This is called from the tunnel reconciler when triggered by a TunnelBinding watch event,
+// ensuring that deleted bindings' routes are removed from the configmap.
+func rebuildTunnelConfig(r GenericTunnelReconciler) error {
+	tunnelName := r.GetTunnel().GetName()
+	tunnelKind := r.GetTunnel().GetObject().GetObjectKind().GroupVersionKind().Kind
+	if tunnelKind == "" {
+		// TypeMeta may not be populated from cache; infer from the adapter type
+		if _, ok := r.GetTunnel().(ClusterTunnelAdapter); ok {
+			tunnelKind = "ClusterTunnel"
+		} else {
+			tunnelKind = "Tunnel"
+		}
+	}
+
+	// Get the existing configmap
+	cm := &corev1.ConfigMap{}
+	cmName := apitypes.NamespacedName{Name: tunnelName, Namespace: r.GetTunnel().GetNamespace()}
+	if err := r.GetClient().Get(r.GetContext(), cmName, cm); err != nil {
+		r.GetLog().Error(err, "unable to get configmap for tunnel config rebuild")
+		return err
+	}
+
+	// Read current config
+	configStr, ok := cm.Data[configmapKey]
+	if !ok {
+		return fmt.Errorf("unable to find key %s in ConfigMap", configmapKey)
+	}
+	config := &cf.Configuration{}
+	if err := yaml.Unmarshal([]byte(configStr), config); err != nil {
+		r.GetLog().Error(err, "unable to parse existing config")
+		return err
+	}
+
+	// List all TunnelBindings for this tunnel
+	bindingList := &networkingv1alpha1.TunnelBindingList{}
+	listOpts := []client.ListOption{client.MatchingLabels(map[string]string{
+		tunnelNameLabel: tunnelName,
+		tunnelKindLabel: tunnelKind,
+	})}
+	if err := r.GetClient().List(r.GetContext(), bindingList, listOpts...); err != nil {
+		r.GetLog().Error(err, "unable to list TunnelBindings for config rebuild")
+		return err
+	}
+
+	// Sort by binding name for deterministic output
+	bindings := bindingList.Items
+	sort.Slice(bindings, func(i, j int) bool {
+		return bindings[i].Name < bindings[j].Name
+	})
+
+	// Build ingress rules from all current bindings
+	finalIngresses := make([]cf.UnvalidatedIngressRule, 0, len(bindings)+1)
+	for _, binding := range bindings {
+		for i, subject := range binding.Subjects {
+			if i >= len(binding.Status.Services) {
+				continue
+			}
+			targetService := subject.Spec.Target
+			if targetService == "" {
+				targetService = binding.Status.Services[i].Target
+			}
+			originRequest := cf.OriginRequestConfig{}
+			originRequest.NoTLSVerify = &subject.Spec.NoTlsVerify
+			originRequest.Http2Origin = &subject.Spec.Http2Origin
+			originRequest.ProxyAddress = &subject.Spec.ProxyAddress
+			originRequest.ProxyPort = &subject.Spec.ProxyPort
+			originRequest.ProxyType = &subject.Spec.ProxyType
+			if caPool := subject.Spec.CaPool; caPool != "" {
+				caPath := fmt.Sprintf("/etc/cloudflared/certs/%s", caPool)
+				originRequest.CAPool = &caPath
+			}
+
+			finalIngresses = append(finalIngresses, cf.UnvalidatedIngressRule{
+				Hostname:      binding.Status.Services[i].Hostname,
+				Service:       targetService,
+				Path:          subject.Spec.Path,
+				OriginRequest: originRequest,
+			})
+		}
+	}
+
+	// Catchall ingress
+	finalIngresses = append(finalIngresses, cf.UnvalidatedIngressRule{
+		Service: r.GetTunnel().GetSpec().FallbackTarget,
+	})
+
+	config.Ingress = finalIngresses
+
+	// Marshal and update configmap
+	configBytes, err := yaml.Marshal(config)
+	if err != nil {
+		return err
+	}
+	newConfigStr := string(configBytes)
+
+	// Only update if content changed
+	if cm.Data[configmapKey] == newConfigStr {
+		return nil
+	}
+
+	cm.Data[configmapKey] = newConfigStr
+	if err := r.GetClient().Update(r.GetContext(), cm); err != nil {
+		r.GetLog().Error(err, "unable to update configmap during tunnel config rebuild")
+		return err
+	}
+
+	// Update deployment checksum to trigger pod restart
+	cfDeployment := &appsv1.Deployment{}
+	if err := r.GetClient().Get(r.GetContext(), cmName, cfDeployment); err != nil {
+		r.GetLog().Error(err, "unable to get deployment for config checksum update")
+		return err
+	}
+	hash := md5.Sum([]byte(newConfigStr))
+	newChecksum := hex.EncodeToString(hash[:])
+	if cfDeployment.Spec.Template.Annotations == nil {
+		cfDeployment.Spec.Template.Annotations = map[string]string{}
+	}
+	if cfDeployment.Spec.Template.Annotations[tunnelConfigChecksum] == newChecksum {
+		return nil
+	}
+	cfDeployment.Spec.Template.Annotations[tunnelConfigChecksum] = newChecksum
+	if err := r.GetClient().Update(r.GetContext(), cfDeployment); err != nil {
+		r.GetLog().Error(err, "unable to update deployment checksum during tunnel config rebuild")
+		return err
+	}
+
+	r.GetLog().Info("Rebuilt tunnel config from current bindings", "bindingCount", len(bindings))
+	return nil
 }
 
 // configMapForTunnel returns a tunnel ConfigMap object

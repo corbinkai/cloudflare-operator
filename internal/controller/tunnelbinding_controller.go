@@ -66,7 +66,7 @@ type TunnelBindingReconciler struct {
 func labelsForBinding(binding networkingv1alpha1.TunnelBinding) map[string]string {
 	labels := map[string]string{
 		tunnelNameLabel: binding.TunnelRef.Name,
-		tunnelKindLabel: binding.Kind,
+		tunnelKindLabel: binding.TunnelRef.Kind,
 	}
 
 	return labels
@@ -151,18 +151,21 @@ func (r *TunnelBindingReconciler) initStruct(ctx context.Context, tunnelBinding 
 func (r *TunnelBindingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	r.log = ctrllog.FromContext(ctx)
 
+	// Clear stale state from previous reconcile — the reconciler struct is reused across calls
+	r.binding = nil
+	r.configmap = nil
+	r.cfAPI = nil
+	r.fallbackTarget = ""
+	r.ctx = nil
+
 	// Fetch TunnelBinding from API
 	tunnelBinding := &networkingv1alpha1.TunnelBinding{}
 	if err := r.Get(ctx, req.NamespacedName, tunnelBinding); err != nil {
 		if apierrors.IsNotFound(err) {
-			// TunnelBinding object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
-			r.log.Info("TunnelBinding deleted, updating config")
-			if err = r.configureCloudflareDaemon(); err != nil {
-				r.log.Error(err, "unable to update config")
-				return ctrl.Result{}, err
-			}
+			// TunnelBinding already deleted. DNS cleanup was handled by the finalizer in deletionLogic().
+			// The configmap will be rebuilt when the tunnel reconciler runs (triggered by the TunnelBinding watch)
+			// or when any remaining TunnelBinding for the same tunnel reconciles.
+			r.log.Info("TunnelBinding not found (already deleted), skipping")
 			return ctrl.Result{}, nil
 		}
 		r.log.Error(err, "unable to fetch TunnelBinding")
