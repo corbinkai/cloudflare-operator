@@ -12,6 +12,7 @@ import (
 	"github.com/adyanth/cloudflare-operator/internal/clients/k8s"
 
 	networkingv1alpha1 "github.com/adyanth/cloudflare-operator/api/v1alpha1"
+	"github.com/go-logr/logr"
 	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -187,6 +188,13 @@ func cleanupTunnel(r GenericTunnelReconciler) (ctrl.Result, bool, error) {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, false, nil
 		}
 		if bypass || *cfDeployment.Spec.Replicas == 0 {
+			// Clean up DNS records before deleting the tunnel.
+			// Best-effort: log errors but proceed with tunnel deletion.
+			if err := cleanupDNSRecords(r); err != nil {
+				r.GetLog().Error(err, "DNS cleanup had errors, proceeding with tunnel deletion")
+				r.GetRecorder().Event(r.GetTunnel().GetObject(), corev1.EventTypeWarning, "DNSCleanupPartial", "Some DNS records could not be cleaned up")
+			}
+
 			if err := r.GetCfAPI().DeleteTunnel(); err != nil {
 				r.GetRecorder().Event(r.GetTunnel().GetObject(), corev1.EventTypeWarning, "FailedDeleting", "Tunnel deletion failed")
 				return ctrl.Result{}, false, err
@@ -273,6 +281,106 @@ func createManagedResources(r GenericTunnelReconciler) (ctrl.Result, error) {
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// cleanupDNSRecords deletes all CNAME and managed TXT records for TunnelBindings referencing this tunnel.
+// Called during tunnel deletion to prevent orphaned DNS records pointing at a non-existent tunnel.
+func cleanupDNSRecords(r GenericTunnelReconciler) error {
+	log := r.GetLog()
+	cfAPI := r.GetCfAPI()
+
+	tunnelName := r.GetTunnel().GetName()
+	tunnelKind := r.GetTunnel().GetObject().GetObjectKind().GroupVersionKind().Kind
+	if tunnelKind == "" {
+		if _, ok := r.GetTunnel().(ClusterTunnelAdapter); ok {
+			tunnelKind = "ClusterTunnel"
+		} else {
+			tunnelKind = "Tunnel"
+		}
+	}
+
+	// List all TunnelBindings for this tunnel.
+	// For ClusterTunnel (cluster-scoped, GetObject().GetNamespace() == ""), list across all namespaces.
+	// For Tunnel (namespace-scoped), restrict to the tunnel's namespace.
+	bindingList := &networkingv1alpha1.TunnelBindingList{}
+	listOpts := []client.ListOption{
+		client.MatchingLabels{
+			tunnelNameLabel: tunnelName,
+			tunnelKindLabel: tunnelKind,
+		},
+	}
+	if ns := r.GetTunnel().GetObject().GetNamespace(); ns != "" {
+		listOpts = append(listOpts, client.InNamespace(ns))
+	}
+
+	if err := r.GetClient().List(r.GetContext(), bindingList, listOpts...); err != nil {
+		return fmt.Errorf("failed to list TunnelBindings for DNS cleanup: %w", err)
+	}
+
+	var errs []error
+	seen := make(map[string]bool)
+
+	for _, binding := range bindingList.Items {
+		for _, svc := range binding.Status.Services {
+			hostname := svc.Hostname
+			if hostname == "" || seen[hostname] {
+				continue
+			}
+			seen[hostname] = true
+
+			if err := deleteDNSForHostname(cfAPI, log, hostname); err != nil {
+				log.Error(err, "failed to delete DNS records for hostname", "hostname", hostname)
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to delete %d DNS record(s) during tunnel cleanup", len(errs))
+	}
+	log.Info("DNS cleanup complete", "hostnameCount", len(seen))
+	return nil
+}
+
+// deleteDNSForHostname deletes the CNAME and managed TXT records for a single hostname.
+// Follows the same pattern as TunnelBindingReconciler.deleteDNSLogic (tunnelbinding_controller.go:364).
+func deleteDNSForHostname(cfAPI *cf.API, log logr.Logger, hostname string) error {
+	var errs []error
+
+	// Get the managed TXT record — contains the CNAME's DNS ID for cross-reference
+	txtId, dnsTxtResponse, canUseDns, err := cfAPI.GetManagedDnsTxt(hostname)
+	if err != nil {
+		log.V(1).Info("could not find managed TXT for hostname, may already be deleted", "hostname", hostname)
+		return nil
+	}
+
+	if !canUseDns {
+		log.V(1).Info("hostname managed by a different tunnel, skipping", "hostname", hostname)
+		return nil
+	}
+
+	// Delete the CNAME using the DNS ID from the TXT management record
+	if dnsTxtResponse.DnsId != "" {
+		if err := cfAPI.DeleteDNSId(hostname, dnsTxtResponse.DnsId, true); err != nil {
+			errs = append(errs, fmt.Errorf("delete CNAME for %s: %w", hostname, err))
+		} else {
+			log.Info("Deleted DNS CNAME record", "hostname", hostname)
+		}
+	}
+
+	// Delete the TXT management record
+	if txtId != "" {
+		if err := cfAPI.DeleteDNSId(hostname, txtId, true); err != nil {
+			errs = append(errs, fmt.Errorf("delete TXT for %s: %w", hostname, err))
+		} else {
+			log.Info("Deleted DNS TXT record", "hostname", hostname)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("partial DNS cleanup for %s: %v", hostname, errs)
+	}
+	return nil
 }
 
 // rebuildTunnelConfig rebuilds the cloudflared ConfigMap ingress rules from all current TunnelBindings.
