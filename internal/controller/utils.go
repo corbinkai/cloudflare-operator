@@ -58,6 +58,7 @@ func getAPIDetails(
 	tunnelStatus networkingv1alpha2.TunnelStatus,
 	namespace string,
 	secretOverride *networkingv1alpha1.SecretReference,
+	cfClientOpts ...cloudflare.Option,
 ) (
 	*cf.API,
 	*corev1.Secret,
@@ -94,7 +95,7 @@ func getAPIDetails(
 	apiKey := string(cfAPIKeyB64)
 	apiEmail := tunnelSpec.Cloudflare.Email
 
-	cloudflareClient, err := getCloudflareClient(apiKey, apiEmail, apiToken)
+	cloudflareClient, err := getCloudflareClient(apiKey, apiEmail, apiToken, cfClientOpts...)
 	if err != nil {
 		log.Error(err, "error initializing cloudflare api client", "client", cloudflareClient)
 		return &cf.API{}, &corev1.Secret{}, err
@@ -115,11 +116,11 @@ func getAPIDetails(
 	return cfAPI, cfSecret, nil
 }
 
-// getCloudflareClient returns an initialized *cloudflare.API using either an API Key + Email or an API Token
-func getCloudflareClient(apiKey, apiEmail, apiToken string) (*cloudflare.API, error) {
+// getCloudflareClient returns an initialized *cloudflare.API using either an API Key + Email or an API Token.
+// Optional cloudflare.Option values can be passed to configure the client (e.g., cloudflare.BaseURL for testing).
+func getCloudflareClient(apiKey, apiEmail, apiToken string, opts ...cloudflare.Option) (*cloudflare.API, error) {
 	if apiToken != "" {
-		return cloudflare.NewWithAPIToken(apiToken)
-	} else {
-		return cloudflare.New(apiKey, apiEmail)
+		return cloudflare.NewWithAPIToken(apiToken, opts...)
 	}
+	return cloudflare.New(apiKey, apiEmail, opts...)
 }

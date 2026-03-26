@@ -405,7 +405,7 @@ func (r *TunnelBindingReconciler) getRelevantTunnelBindings() ([]networkingv1alp
 	// Fetch TunnelBindings from API
 	listOpts := []client.ListOption{client.MatchingLabels(map[string]string{
 		tunnelNameLabel: r.binding.TunnelRef.Name,
-		tunnelKindLabel: r.binding.Kind,
+		tunnelKindLabel: r.binding.TunnelRef.Kind,
 	})}
 	tunnelBindingList := &networkingv1alpha1.TunnelBindingList{}
 	if err := r.List(r.ctx, tunnelBindingList, listOpts...); err != nil {
