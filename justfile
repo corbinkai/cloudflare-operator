@@ -2,6 +2,8 @@ set dotenv-load
 
 project := "cloudflare-operator"
 cluster_name := "koshee-cf-operator"
+kube_ctx := "k3d-" + cluster_name
+kubeconfig := justfile_directory() + "/kubeconfig-k3d.yaml"
 registry_host := "localhost:9050"
 registry := "koshee-dev-zot:5000"
 image := registry + "/" + project + ":dev"
@@ -105,11 +107,12 @@ create-cluster:
     set -e
     if k3d cluster list 2>/dev/null | grep -qw {{cluster_name}}; then
       echo "Cluster {{cluster_name}} already exists"
-      exit 0
+    else
+      k3d cluster create --config k3d/cluster.yaml
     fi
-    k3d cluster create --config k3d/cluster.yaml
+    k3d kubeconfig get {{cluster_name}} > {{kubeconfig}}
     echo "Waiting for cluster to be ready..."
-    kubectl wait --for=condition=Ready nodes --all --timeout=120s --context k3d-{{cluster_name}}
+    KUBECONFIG={{kubeconfig}} kubectl wait --for=condition=Ready nodes --all --timeout=120s --context {{kube_ctx}}
 
 # Delete the k3d development cluster
 delete-cluster:
@@ -120,7 +123,7 @@ cluster-status:
     @k3d cluster list | head -1
     @k3d cluster list | grep {{cluster_name}} || echo "Cluster {{cluster_name}} not found"
     @echo ""
-    @kubectl get nodes --context k3d-{{cluster_name}} 2>/dev/null || echo "Cannot reach cluster"
+    @KUBECONFIG={{kubeconfig}} kubectl get nodes --context {{kube_ctx}} 2>/dev/null || echo "Cannot reach cluster"
 
 # ============================================================
 # DEPLOYMENT
@@ -128,11 +131,11 @@ cluster-status:
 
 # Install CRDs into the k3d cluster
 install-crds:
-    kubectl apply -f config/crd/bases/ --context k3d-{{cluster_name}}
+    KUBECONFIG={{kubeconfig}} kubectl apply -f config/crd/bases/ --context {{kube_ctx}}
 
 # Uninstall CRDs from the k3d cluster
 uninstall-crds:
-    kubectl delete -f config/crd/bases/ --context k3d-{{cluster_name}} --ignore-not-found
+    KUBECONFIG={{kubeconfig}} kubectl delete -f config/crd/bases/ --context {{kube_ctx}} --ignore-not-found
 
 # Deploy the operator to the k3d cluster
 deploy: image install-crds
@@ -143,10 +146,10 @@ deploy: image install-crds
       KUSTOMIZE_BIN="$(command -v kustomize)"
     fi
     (cd config/manager && "$KUSTOMIZE_BIN" edit set image controller={{image}})
-    "$KUSTOMIZE_BIN" build --load-restrictor LoadRestrictionsNone config/local | kubectl apply --context k3d-{{cluster_name}} -f -
+    "$KUSTOMIZE_BIN" build --load-restrictor LoadRestrictionsNone config/local | KUBECONFIG={{kubeconfig}} kubectl apply --context {{kube_ctx}} -f -
     echo "Waiting for operator deployment..."
-    kubectl wait --for=condition=Available deployment/cloudflare-operator-controller-manager \
-      -n cloudflare-operator-system --timeout=120s --context k3d-{{cluster_name}}
+    KUBECONFIG={{kubeconfig}} kubectl wait --for=condition=Available deployment/cloudflare-operator-controller-manager \
+      -n cloudflare-operator-system --timeout=120s --context {{kube_ctx}}
 
 # Undeploy the operator from the k3d cluster
 undeploy:
@@ -156,7 +159,7 @@ undeploy:
     if [ ! -x "$KUSTOMIZE_BIN" ]; then
       KUSTOMIZE_BIN="$(command -v kustomize)"
     fi
-    "$KUSTOMIZE_BIN" build --load-restrictor LoadRestrictionsNone config/local | kubectl delete --context k3d-{{cluster_name}} --ignore-not-found -f -
+    "$KUSTOMIZE_BIN" build --load-restrictor LoadRestrictionsNone config/local | KUBECONFIG={{kubeconfig}} kubectl delete --context {{kube_ctx}} --ignore-not-found -f -
 
 # ============================================================
 # DEVELOPMENT WORKFLOW
@@ -165,20 +168,20 @@ undeploy:
 # Full setup: create cluster, build, deploy
 dev: create-cluster deploy
     @echo ""
-    @echo "Operator running in k3d-{{cluster_name}}"
-    @echo "  kubectl --context k3d-{{cluster_name}} get pods -n cloudflare-operator-system"
+    @echo "Operator running in {{kube_ctx}}"
+    @echo "  KUBECONFIG={{kubeconfig}} kubectl --context {{kube_ctx}} get pods -n cloudflare-operator-system"
 
 # Rebuild and redeploy (fast iteration)
 reload: image
-    kubectl rollout restart deployment/cloudflare-operator-controller-manager \
-      -n cloudflare-operator-system --context k3d-{{cluster_name}}
-    kubectl rollout status deployment/cloudflare-operator-controller-manager \
-      -n cloudflare-operator-system --context k3d-{{cluster_name}} --timeout=60s
+    KUBECONFIG={{kubeconfig}} kubectl rollout restart deployment/cloudflare-operator-controller-manager \
+      -n cloudflare-operator-system --context {{kube_ctx}}
+    KUBECONFIG={{kubeconfig}} kubectl rollout status deployment/cloudflare-operator-controller-manager \
+      -n cloudflare-operator-system --context {{kube_ctx}} --timeout=60s
 
 # View operator logs
 logs:
-    kubectl logs -f deployment/cloudflare-operator-controller-manager \
-      -n cloudflare-operator-system --context k3d-{{cluster_name}} -c manager
+    KUBECONFIG={{kubeconfig}} kubectl logs -f deployment/cloudflare-operator-controller-manager \
+      -n cloudflare-operator-system --context {{kube_ctx}} -c manager
 
 # ============================================================
 # CI
@@ -209,19 +212,19 @@ build-cfmock:
 
 # Deploy the mock CF server to the cluster
 deploy-cfmock: build-cfmock
-    kubectl apply -f test/e2e/manifests/cfmock-deployment.yaml --context k3d-{{cluster_name}}
-    kubectl wait --for=condition=Available deployment/cfmock-server \
-      -n cloudflare-operator-system --timeout=60s --context k3d-{{cluster_name}}
+    KUBECONFIG={{kubeconfig}} kubectl apply -f test/e2e/manifests/cfmock-deployment.yaml --context {{kube_ctx}}
+    KUBECONFIG={{kubeconfig}} kubectl wait --for=condition=Available deployment/cfmock-server \
+      -n cloudflare-operator-system --timeout=60s --context {{kube_ctx}}
 
 # Patch the operator to use the mock CF server
 patch-operator-cfmock:
-    kubectl set env deployment/cloudflare-operator-controller-manager \
+    KUBECONFIG={{kubeconfig}} kubectl set env deployment/cloudflare-operator-controller-manager \
       -n cloudflare-operator-system \
       -c manager \
       CLOUDFLARE_API_BASE_URL=http://cfmock-server.cloudflare-operator-system:8080/client/v4 \
-      --context k3d-{{cluster_name}}
-    kubectl rollout status deployment/cloudflare-operator-controller-manager \
-      -n cloudflare-operator-system --timeout=60s --context k3d-{{cluster_name}}
+      --context {{kube_ctx}}
+    KUBECONFIG={{kubeconfig}} kubectl rollout status deployment/cloudflare-operator-controller-manager \
+      -n cloudflare-operator-system --timeout=60s --context {{kube_ctx}}
 
 # Run e2e tests (requires cluster + operator + cfmock deployed)
 e2e: deploy-cfmock patch-operator-cfmock
