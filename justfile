@@ -171,6 +171,12 @@ dev: create-cluster deploy
     @echo "Operator running in {{kube_ctx}}"
     @echo "  KUBECONFIG={{kubeconfig}} kubectl --context {{kube_ctx}} get pods -n cloudflare-operator-system"
 
+shared-up: dev
+
+standalone-up: dev
+
+destroy: undeploy delete-cluster
+
 # Rebuild and redeploy (fast iteration)
 reload: image
     KUBECONFIG={{kubeconfig}} kubectl rollout restart deployment/cloudflare-operator-controller-manager \
