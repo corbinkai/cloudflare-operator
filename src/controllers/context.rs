@@ -11,4 +11,7 @@ pub struct Context {
 
     /// Whether to overwrite DNS records not created by this operator
     pub overwrite_unmanaged: bool,
+
+    /// Image to use for the cloudflared container
+    pub cloudflared_image: String,
 }
