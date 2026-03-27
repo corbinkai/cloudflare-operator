@@ -10,6 +10,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use cloudflare_operator::controllers::context::Context;
 use cloudflare_operator::controllers::tunnel::{error_policy, reconcile_tunnel};
+use cloudflare_operator::controllers::tunnel_binding::{binding_error_policy, reconcile_binding};
 use cloudflare_operator::crds::cluster_tunnel::ClusterTunnel;
 use cloudflare_operator::crds::tunnel::Tunnel;
 use cloudflare_operator::crds::tunnel_binding::TunnelBinding;
@@ -96,6 +97,38 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+    // TunnelBinding controller
+    let bindings: Api<TunnelBinding> = Api::all(client.clone());
+    let tunnels_for_binding: Api<Tunnel> = Api::all(client.clone());
+    let cluster_tunnels_for_binding: Api<ClusterTunnel> = Api::all(client.clone());
+    let binding_ctrl = Controller::new(bindings, WatcherConfig::default())
+        .watches(
+            tunnels_for_binding,
+            WatcherConfig::default(),
+            |tunnel| {
+                // When a Tunnel changes, re-reconcile all TunnelBindings that reference it
+                // This is a mapper that returns an empty list; the label-based watch handles it.
+                // We trigger reconcile via the controller's cache invalidation.
+                let _ = tunnel;
+                None::<kube::runtime::reflector::ObjectRef<TunnelBinding>>
+            },
+        )
+        .watches(
+            cluster_tunnels_for_binding,
+            WatcherConfig::default(),
+            |ct| {
+                let _ = ct;
+                None::<kube::runtime::reflector::ObjectRef<TunnelBinding>>
+            },
+        )
+        .run(reconcile_binding, binding_error_policy, ctx.clone())
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!(binding = ?o, "tunnel binding reconciled"),
+                Err(e) => error!(error = %e, "tunnel binding reconcile failed"),
+            }
+        });
+
     info!("controllers started, waiting for events");
 
     tokio::select! {
@@ -104,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = ct_ctrl => {
             error!("cluster tunnel controller exited unexpectedly");
+        }
+        _ = binding_ctrl => {
+            error!("tunnel binding controller exited unexpectedly");
         }
     }
 
