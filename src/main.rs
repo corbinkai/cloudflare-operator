@@ -1,16 +1,23 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::api::Api;
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::Controller;
 use kube::Client;
-use tracing::{error, info};
+use kube_lease_manager::LeaseManagerBuilder;
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
+use cloudflare_operator::controllers::access_tunnel::{
+    access_tunnel_error_policy, reconcile_access_tunnel,
+};
 use cloudflare_operator::controllers::context::Context;
 use cloudflare_operator::controllers::tunnel::{error_policy, reconcile_tunnel};
 use cloudflare_operator::controllers::tunnel_binding::{binding_error_policy, reconcile_binding};
+use cloudflare_operator::crds::access_tunnel::AccessTunnel;
 use cloudflare_operator::crds::cluster_tunnel::ClusterTunnel;
 use cloudflare_operator::crds::tunnel::Tunnel;
 use cloudflare_operator::crds::tunnel_binding::TunnelBinding;
@@ -58,10 +65,54 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(false),
     });
 
+    // Leader election
+    let leader_elect = std::env::var("LEADER_ELECT")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+
+    let _lease_task = if leader_elect {
+        let lease_manager = LeaseManagerBuilder::new(client.clone(), "9f193cf8.cfargotunnel.com")
+            .with_namespace(&ctx.cluster_resource_namespace)
+            .with_duration(15)
+            .with_grace(5)
+            .build()
+            .await?;
+        let (mut lease_channel, lease_task) = lease_manager.watch().await;
+
+        info!("waiting for leader lease...");
+        while !*lease_channel.borrow_and_update() {
+            if lease_channel.changed().await.is_err() {
+                anyhow::bail!("leader lease watch channel closed");
+            }
+        }
+        info!("acquired leader lease, starting controllers");
+
+        // Spawn a task that exits if leadership is lost
+        tokio::spawn(async move {
+            loop {
+                if lease_channel.changed().await.is_err() {
+                    break;
+                }
+                if !*lease_channel.borrow() {
+                    error!("lost leader lease, shutting down");
+                    std::process::exit(1);
+                }
+            }
+        });
+
+        Some(lease_task)
+    } else {
+        info!("leader election disabled, starting controllers immediately");
+        None
+    };
+
     // Tunnel controller (namespaced)
     let tunnels: Api<Tunnel> = Api::all(client.clone());
     let tunnel_bindings_for_tunnel: Api<TunnelBinding> = Api::all(client.clone());
     let tunnel_ctrl = Controller::new(tunnels, WatcherConfig::default())
+        .owns(Api::<ConfigMap>::all(client.clone()), WatcherConfig::default())
+        .owns(Api::<Secret>::all(client.clone()), WatcherConfig::default())
+        .owns(Api::<Deployment>::all(client.clone()), WatcherConfig::default())
         .watches(
             tunnel_bindings_for_tunnel,
             WatcherConfig::default(),
@@ -88,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
     let cluster_tunnels: Api<ClusterTunnel> = Api::all(client.clone());
     let tunnel_bindings_for_ct: Api<TunnelBinding> = Api::all(client.clone());
     let ct_ctrl = Controller::new(cluster_tunnels, WatcherConfig::default())
+        .owns(Api::<ConfigMap>::all(client.clone()), WatcherConfig::default())
+        .owns(Api::<Secret>::all(client.clone()), WatcherConfig::default())
+        .owns(Api::<Deployment>::all(client.clone()), WatcherConfig::default())
         .watches(
             tunnel_bindings_for_ct,
             WatcherConfig::default(),
@@ -138,6 +192,18 @@ async fn main() -> anyhow::Result<()> {
             match res {
                 Ok(o) => info!(binding = ?o, "tunnel binding reconciled"),
                 Err(e) => error!(error = ?e, "tunnel binding reconcile failed"),
+            }
+        });
+
+    // AccessTunnel controller (namespaced)
+    let access_tunnels: Api<AccessTunnel> = Api::all(client.clone());
+    let at_ctrl = Controller::new(access_tunnels, WatcherConfig::default())
+        .owns(Api::<Deployment>::all(client.clone()), WatcherConfig::default())
+        .run(reconcile_access_tunnel, access_tunnel_error_policy, ctx.clone())
+        .for_each(|res| async move {
+            match res {
+                Ok(o) => info!(access_tunnel = ?o, "access tunnel reconciled"),
+                Err(e) => error!(error = ?e, "access tunnel reconcile failed"),
             }
         });
 
@@ -211,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
         _ = tunnel_ctrl => { error!("tunnel controller exited unexpectedly"); }
         _ = ct_ctrl => { error!("cluster tunnel controller exited unexpectedly"); }
         _ = binding_ctrl => { error!("tunnel binding controller exited unexpectedly"); }
+        _ = at_ctrl => { error!("access tunnel controller exited unexpectedly"); }
         _ = gc_ctrl => { error!("gateway class controller exited unexpectedly"); }
         _ = gw_ctrl => { error!("gateway controller exited unexpectedly"); }
         _ = hr_ctrl => { error!("httproute controller exited unexpectedly"); }
@@ -222,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         _ = tunnel_ctrl => { error!("tunnel controller exited unexpectedly"); }
         _ = ct_ctrl => { error!("cluster tunnel controller exited unexpectedly"); }
         _ = binding_ctrl => { error!("tunnel binding controller exited unexpectedly"); }
+        _ = at_ctrl => { error!("access tunnel controller exited unexpectedly"); }
     }
 
     Ok(())

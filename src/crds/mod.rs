@@ -1,3 +1,4 @@
+pub mod access_tunnel;
 pub mod cluster_tunnel;
 #[cfg(feature = "gateway-api")]
 pub mod gateway;
@@ -6,6 +7,7 @@ pub mod tunnel;
 pub mod tunnel_binding;
 pub mod types;
 
+pub use access_tunnel::*;
 pub use cluster_tunnel::*;
 #[cfg(feature = "gateway-api")]
 pub use gateway::*;

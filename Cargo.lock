@@ -192,6 +192,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "kube",
+ "kube-lease-manager",
  "md-5",
  "rand",
  "reqwest",
@@ -1103,6 +1104,20 @@ dependencies = [
  "serde",
  "serde_json",
  "syn",
+]
+
+[[package]]
+name = "kube-lease-manager"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "159a11dbcf655bb619f6479081e565ea889bb860c5d7d830f3ad90adc74fb90a"
+dependencies = [
+ "k8s-openapi",
+ "kube",
+ "rand",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,9 +1,11 @@
+pub mod access_tunnel;
 pub mod context;
 #[cfg(feature = "gateway-api")]
 pub mod gateway;
 pub mod tunnel;
 pub mod tunnel_binding;
 
+pub use access_tunnel::{access_tunnel_error_policy, reconcile_access_tunnel};
 pub use context::Context;
 #[cfg(feature = "gateway-api")]
 pub use gateway::{

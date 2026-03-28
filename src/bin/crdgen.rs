@@ -1,4 +1,4 @@
-use cloudflare_operator::crds::{ClusterTunnel, Tunnel, TunnelBinding};
+use cloudflare_operator::crds::{AccessTunnel, ClusterTunnel, Tunnel, TunnelBinding};
 use kube::CustomResourceExt;
 
 fn main() {
@@ -14,4 +14,9 @@ fn main() {
 
     let tunnel_binding_crd = serde_yaml::to_string(&TunnelBinding::crd()).unwrap();
     print!("{tunnel_binding_crd}");
+
+    println!("---");
+
+    let access_tunnel_crd = serde_yaml::to_string(&AccessTunnel::crd()).unwrap();
+    print!("{access_tunnel_crd}");
 }

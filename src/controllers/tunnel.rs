@@ -416,6 +416,23 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
         .await?;
     info!(name = %name, "deployment applied");
 
+    // Apply deploy_patch as a second SSA pass with a different field manager
+    let deploy_patch_str = &spec.deploy_patch;
+    if deploy_patch_str != "{}" && !deploy_patch_str.is_empty() {
+        let patch_value: serde_json::Value = serde_json::from_str(deploy_patch_str)?;
+        let patch_obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": ns},
+            "spec": patch_value
+        });
+        let pp2 = PatchParams::apply("cloudflare-operator-patch");
+        deploy_api
+            .patch(&name, &pp2, &Patch::Apply(&patch_obj))
+            .await?;
+        info!(name = %name, "deploy_patch applied");
+    }
+
     // 9. Rebuild ConfigMap ingress from current TunnelBindings
     rebuild_tunnel_config(k8s, &name, T::kind_str(), &ns, &spec.fallback_target, &cf_client).await?;
 
