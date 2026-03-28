@@ -2,13 +2,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
-use kube::ResourceExt;
+use kube::runtime::events::{Event, EventType, Recorder};
+use kube::{Resource, ResourceExt};
 use md5::{Digest, Md5};
 use tracing::{error, info, warn};
+
+use crate::metrics::{RECONCILE_DURATION, RECONCILE_TOTAL};
 
 use crate::cloudflare::client::CfClient;
 use crate::cloudflare::types::TunnelIngressRule;
@@ -44,14 +48,51 @@ pub async fn reconcile_binding(
     obj: Arc<TunnelBinding>,
     ctx: Arc<Context>,
 ) -> Result<Action, Error> {
+    let start = std::time::Instant::now();
+    let result = reconcile_binding_inner(obj, ctx).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    RECONCILE_DURATION
+        .with_label_values(&["binding"])
+        .observe(elapsed);
+    let result_label = if result.is_ok() { "success" } else { "error" };
+    RECONCILE_TOTAL
+        .with_label_values(&["binding", result_label])
+        .inc();
+    result
+}
+
+async fn reconcile_binding_inner(
+    obj: Arc<TunnelBinding>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
     let k8s = &ctx.client;
     let binding_ns = obj.metadata.namespace.clone().unwrap_or_default();
     let binding_name = obj.name_any();
+    let recorder = ctx.recorder();
+    let obj_ref = obj.object_ref(&());
 
     info!(name = %binding_name, ns = %binding_ns, "reconciling tunnel binding");
 
     // 1. Look up the referenced Tunnel or ClusterTunnel
-    let tunnel_info = get_tunnel_info(k8s, &obj, &binding_ns, &ctx.cluster_resource_namespace).await?;
+    let tunnel_info = match get_tunnel_info(k8s, &obj, &binding_ns, &ctx.cluster_resource_namespace).await {
+        Ok(info) => info,
+        Err(e) => {
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "ErrTunnel".into(),
+                        note: Some(format!("Failed to look up referenced tunnel: {e}")),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
+            return Err(e);
+        }
+    };
 
     // 2. Read CF credentials from the tunnel's Secret (or credential_secret_ref override)
     let (secret_name, secret_ns) = match &obj.tunnel_ref.credential_secret_ref {
@@ -66,11 +107,29 @@ pub async fn reconcile_binding(
     })?;
 
     // 3. Build CfClient
-    let mut cf_client = build_cf_client(
+    let mut cf_client = match build_cf_client(
         &tunnel_info.cloudflare,
         &cf_secret,
         ctx.cloudflare_api_base_url.as_deref(),
-    )?;
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "ErrApiConfig".into(),
+                        note: Some(format!("Failed to build Cloudflare API client: {e}")),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
+            return Err(e);
+        }
+    };
     cf_client.domain = tunnel_info.cloudflare.domain.clone();
     cf_client.account_id = tunnel_info.account_id.clone();
     cf_client.tunnel_id = tunnel_info.tunnel_id.clone();
@@ -84,19 +143,35 @@ pub async fn reconcile_binding(
 
     // 4. Get the tunnel's ConfigMap
     let cm_api: Api<ConfigMap> = Api::namespaced(k8s.clone(), &tunnel_info.tunnel_ns);
-    let configmap = cm_api.get(&obj.tunnel_ref.name).await.map_err(|e| {
-        error!(
-            configmap = %obj.tunnel_ref.name,
-            ns = %tunnel_info.tunnel_ns,
-            error = %e,
-            "failed to get tunnel configmap"
-        );
-        e
-    })?;
+    let configmap = match cm_api.get(&obj.tunnel_ref.name).await {
+        Ok(cm) => cm,
+        Err(e) => {
+            error!(
+                configmap = %obj.tunnel_ref.name,
+                ns = %tunnel_info.tunnel_ns,
+                error = %e,
+                "failed to get tunnel configmap"
+            );
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "ErrConfigMap".into(),
+                        note: Some(format!("Failed to get tunnel ConfigMap: {e}")),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
+            return Err(e.into());
+        }
+    };
 
     // 5. If deletion timestamp set, run deletion logic
     if obj.metadata.deletion_timestamp.is_some() {
-        return handle_deletion(k8s, &obj, &binding_ns, &cf_client).await;
+        return handle_deletion(k8s, &obj, &binding_ns, &cf_client, &recorder, &obj_ref).await;
     }
 
     // 6. Compute status: resolve each subject to hostname + target
@@ -122,6 +197,19 @@ pub async fn reconcile_binding(
         &configmap,
     )
     .await?;
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "Configured".into(),
+                note: Some("Cloudflared daemon ConfigMap updated".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     // 9. Creation logic: set labels, finalizer, DNS records
     handle_creation(
@@ -133,6 +221,8 @@ pub async fn reconcile_binding(
         &old_services,
         &cf_client,
         ctx.overwrite_unmanaged,
+        &recorder,
+        &obj_ref,
     )
     .await?;
 
@@ -356,6 +446,8 @@ async fn handle_deletion(
     binding: &TunnelBinding,
     binding_ns: &str,
     cf_client: &CfClient,
+    recorder: &Recorder,
+    obj_ref: &ObjectReference,
 ) -> Result<Action, Error> {
     let name = binding.name_any();
     let has_finalizer = binding
@@ -377,9 +469,42 @@ async fn handle_deletion(
             if svc.hostname.is_empty() {
                 continue;
             }
-            if let Err(e) = delete_dns_for_hostname(cf_client, &svc.hostname).await {
-                error!(hostname = %svc.hostname, error = %e, "failed to delete DNS during finalization");
-                had_errors = true;
+            match delete_dns_for_hostname(cf_client, &svc.hostname).await {
+                Ok(()) => {
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Normal,
+                                reason: "DeletedDns".into(),
+                                note: Some(format!("Deleted DNS CNAME for {}", svc.hostname)),
+                                action: "Deleting".into(),
+                                secondary: None,
+                            },
+                            obj_ref,
+                        )
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    error!(hostname = %svc.hostname, error = %e, "failed to delete DNS during finalization");
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Warning,
+                                reason: "FailedDeletingDns".into(),
+                                note: Some(format!(
+                                    "Failed to delete DNS for {}: {e}",
+                                    svc.hostname
+                                )),
+                                action: "Deleting".into(),
+                                secondary: None,
+                            },
+                            obj_ref,
+                        )
+                        .await
+                        .ok();
+                    had_errors = true;
+                }
             }
         }
     }
@@ -417,6 +542,19 @@ async fn handle_deletion(
     .await?;
 
     info!(name = %name, "finalizer removed from tunnel binding");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "FinalizerUnset".into(),
+                note: Some("Finalizer removed from tunnel binding".into()),
+                action: "Deleting".into(),
+                secondary: None,
+            },
+            obj_ref,
+        )
+        .await
+        .ok();
     Ok(Action::requeue(Duration::from_secs(1)))
 }
 
@@ -479,6 +617,8 @@ async fn handle_creation(
     old_services: &[ServiceInfo],
     cf_client: &CfClient,
     overwrite_unmanaged: bool,
+    recorder: &Recorder,
+    obj_ref: &ObjectReference,
 ) -> Result<(), Error> {
     let api: Api<TunnelBinding> = Api::namespaced(k8s.clone(), ns);
 
@@ -506,6 +646,19 @@ async fn handle_creation(
         &Patch::Merge(&label_patch),
     )
     .await?;
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "MetaSet".into(),
+                note: Some("Labels set on tunnel binding".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            obj_ref,
+        )
+        .await
+        .ok();
 
     // If DNS updates disabled, stop here
     if binding.tunnel_ref.disable_dns_updates {
@@ -532,6 +685,19 @@ async fn handle_creation(
         )
         .await?;
         info!(name = %name, "finalizer added to tunnel binding");
+        recorder
+            .publish(
+                &Event {
+                    type_: EventType::Normal,
+                    reason: "FinalizerSet".into(),
+                    note: Some("Finalizer added to tunnel binding".into()),
+                    action: "Reconciling".into(),
+                    secondary: None,
+                },
+                obj_ref,
+            )
+            .await
+            .ok();
     }
 
     // Create/update DNS entries for each hostname
@@ -540,10 +706,39 @@ async fn handle_creation(
         if svc.hostname.is_empty() {
             continue;
         }
-        if let Err(e) = create_dns_for_hostname(cf_client, &svc.hostname, overwrite_unmanaged).await
-        {
-            error!(hostname = %svc.hostname, error = %e, "failed to create/update DNS");
-            had_errors = true;
+        match create_dns_for_hostname(cf_client, &svc.hostname, overwrite_unmanaged).await {
+            Ok(()) => {
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Normal,
+                            reason: "CreatedDns".into(),
+                            note: Some(format!("DNS CNAME+TXT created/updated for {}", svc.hostname)),
+                            action: "Reconciling".into(),
+                            secondary: None,
+                        },
+                        obj_ref,
+                    )
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                error!(hostname = %svc.hostname, error = %e, "failed to create/update DNS");
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Warning,
+                            reason: "FailedCreatingDns".into(),
+                            note: Some(format!("Failed to create DNS for {}: {e}", svc.hostname)),
+                            action: "Reconciling".into(),
+                            secondary: None,
+                        },
+                        obj_ref,
+                    )
+                    .await
+                    .ok();
+                had_errors = true;
+            }
         }
     }
 
@@ -555,9 +750,26 @@ async fn handle_creation(
         }
         if !new_hostnames.contains(old_svc.hostname.as_str()) {
             info!(hostname = %old_svc.hostname, "FQDN changed, cleaning up old DNS");
-            if let Err(e) = delete_dns_for_hostname(cf_client, &old_svc.hostname).await {
-                warn!(hostname = %old_svc.hostname, error = %e, "failed to clean up old DNS");
-                had_errors = true;
+            match delete_dns_for_hostname(cf_client, &old_svc.hostname).await {
+                Ok(()) => {
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Normal,
+                                reason: "DeletedDns".into(),
+                                note: Some(format!("Old DNS cleaned up for {}", old_svc.hostname)),
+                                action: "Reconciling".into(),
+                                secondary: None,
+                            },
+                            obj_ref,
+                        )
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    warn!(hostname = %old_svc.hostname, error = %e, "failed to clean up old DNS");
+                    had_errors = true;
+                }
             }
         }
     }

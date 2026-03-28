@@ -12,8 +12,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, 
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType};
 use kube::{Resource, ResourceExt};
 use tracing::{error, info};
+
+use crate::metrics::{RECONCILE_DURATION, RECONCILE_TOTAL};
 
 use crate::crds::access_tunnel::{AccessTunnel, AccessTunnelServiceToken};
 use crate::error::Error;
@@ -26,9 +29,28 @@ pub async fn reconcile_access_tunnel(
     obj: Arc<AccessTunnel>,
     ctx: Arc<Context>,
 ) -> Result<Action, Error> {
+    let start = std::time::Instant::now();
+    let result = reconcile_access_tunnel_inner(obj, ctx).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    RECONCILE_DURATION
+        .with_label_values(&["accesstunnel"])
+        .observe(elapsed);
+    let result_label = if result.is_ok() { "success" } else { "error" };
+    RECONCILE_TOTAL
+        .with_label_values(&["accesstunnel", result_label])
+        .inc();
+    result
+}
+
+async fn reconcile_access_tunnel_inner(
+    obj: Arc<AccessTunnel>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
     let k8s = &ctx.client;
     let name = obj.name_any();
     let ns = obj.namespace().unwrap_or_default();
+    let recorder = ctx.recorder();
+    let obj_ref = obj.object_ref(&());
 
     info!(name = %name, ns = %ns, "reconciling access tunnel");
 
@@ -107,6 +129,19 @@ pub async fn reconcile_access_tunnel(
         )
         .await?;
     info!(name = %name, "access tunnel deployment applied");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "DeploymentApplied".into(),
+                note: Some("Access tunnel Deployment applied".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     // Apply Service
     let svc_name = if target.svc.name.is_empty() {
@@ -123,6 +158,19 @@ pub async fn reconcile_access_tunnel(
         )
         .await?;
     info!(name = %name, "access tunnel service applied");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "ServiceApplied".into(),
+                note: Some("Access tunnel Service applied".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }

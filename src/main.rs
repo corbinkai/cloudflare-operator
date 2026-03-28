@@ -7,8 +7,9 @@ use kube::api::Api;
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::runtime::Controller;
 use kube::Client;
+use kube::runtime::events::Reporter;
 use kube_lease_manager::LeaseManagerBuilder;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cloudflare_operator::controllers::access_tunnel::{
@@ -53,8 +54,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(false);
     let cloudflare_api_base_url = std::env::var("CLOUDFLARE_API_BASE_URL").ok();
 
+    let reporter = Reporter {
+        controller: "cloudflare-operator".into(),
+        instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+    };
+
     let ctx = Arc::new(Context {
         client: client.clone(),
+        reporter,
         cloudflare_api_base_url,
         cluster_resource_namespace,
         overwrite_unmanaged,
@@ -256,14 +263,27 @@ async fn main() -> anyhow::Result<()> {
             .await;
     };
 
-    // Health/readiness probe server on :8081
+    // Health/readiness probe + metrics server on :8081
     let health_server = async {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await.unwrap();
-        info!("health probe server listening on :8081");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = std::env::var("HEALTH_PROBE_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8081".into());
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        info!("health/metrics server listening on {}", addr);
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let response = if request.contains("GET /metrics") {
+                    let body = cloudflare_operator::metrics::gather_metrics();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string()
+                };
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         }

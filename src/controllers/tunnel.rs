@@ -14,11 +14,14 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, 
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Event, EventType};
 use kube::{Resource, ResourceExt};
 use md5::{Digest, Md5};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::{error, info, warn};
+
+use crate::metrics::{RECONCILE_DURATION, RECONCILE_TOTAL};
 
 use crate::cloudflare::client::CfClient;
 use crate::cloudflare::types::TunnelCredentials;
@@ -124,13 +127,46 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
     obj: Arc<T>,
     ctx: Arc<Context>,
 ) -> Result<Action, Error> {
+    let start = std::time::Instant::now();
+    let controller_label = T::kind_str().to_lowercase();
+    let result = reconcile_tunnel_inner::<T>(obj, ctx).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    RECONCILE_DURATION
+        .with_label_values(&[&controller_label])
+        .observe(elapsed);
+    let result_label = if result.is_ok() { "success" } else { "error" };
+    RECONCILE_TOTAL
+        .with_label_values(&[&controller_label, result_label])
+        .inc();
+    result
+}
+
+async fn reconcile_tunnel_inner<T: TunnelLike>(
+    obj: Arc<T>,
+    ctx: Arc<Context>,
+) -> Result<Action, Error> {
     let k8s = &ctx.client;
     let ns = obj.resource_namespace(&ctx.cluster_resource_namespace);
     let name = obj.name_any();
     let spec = obj.tunnel_spec();
     let status = obj.tunnel_status().cloned().unwrap_or_default();
+    let recorder = ctx.recorder();
+    let obj_ref = obj.object_ref(&());
 
     info!(name = %name, ns = %ns, kind = T::kind_str(), "reconciling tunnel");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "Reconciling".into(),
+                note: Some(format!("Reconciling {} {name}", T::kind_str())),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     // 1. Read CF credentials from the referenced Secret
     let secrets_api: Api<Secret> = Api::namespaced(k8s.clone(), &ns);
@@ -207,6 +243,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
 
             if has_finalizer {
                 info!(name = %name, "starting tunnel deletion cycle");
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Normal,
+                            reason: "Deleting".into(),
+                            note: Some(format!("Starting deletion of tunnel {name}")),
+                            action: "Deleting".into(),
+                            secondary: None,
+                        },
+                        &obj_ref,
+                    )
+                    .await
+                    .ok();
 
                 // Scale deployment to 0 before deleting tunnel
                 let deploy_api: Api<Deployment> = Api::namespaced(k8s.clone(), &ns);
@@ -222,17 +271,56 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
 
                 if scale_needed {
                     info!(name = %name, "scaling down cloudflared deployment");
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Normal,
+                                reason: "Scaling".into(),
+                                note: Some("Scaling cloudflared deployment to 0 for deletion".into()),
+                                action: "Scaling".into(),
+                                secondary: None,
+                            },
+                            &obj_ref,
+                        )
+                        .await
+                        .ok();
                     let patch = serde_json::json!({
                         "spec": { "replicas": 0 }
                     });
                     deploy_api
                         .patch(&name, &PatchParams::apply("cloudflare-operator"), &Patch::Merge(&patch))
                         .await?;
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Normal,
+                                reason: "Scaled".into(),
+                                note: Some("Deployment scaled to 0".into()),
+                                action: "Scaling".into(),
+                                secondary: None,
+                            },
+                            &obj_ref,
+                        )
+                        .await
+                        .ok();
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
 
                 // Clean up DNS records for all bindings referencing this tunnel
                 cleanup_dns_records(k8s, &mut cf_client, &name, T::kind_str(), &ns, T::is_cluster_scoped()).await;
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Normal,
+                            reason: "DNSCleaned".into(),
+                            note: Some("DNS records cleaned up for tunnel bindings".into()),
+                            action: "Deleting".into(),
+                            secondary: None,
+                        },
+                        &obj_ref,
+                    )
+                    .await
+                    .ok();
 
                 // Clear edge configuration (best-effort)
                 if let Err(e) = cf_client.clear_tunnel_configuration().await {
@@ -240,8 +328,43 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
                 }
 
                 // Delete tunnel on Cloudflare
-                cf_client.delete_tunnel().await?;
-                info!(name = %name, tunnel_id = %cf_client.tunnel_id, "tunnel deleted on cloudflare");
+                match cf_client.delete_tunnel().await {
+                    Ok(()) => {
+                        info!(name = %name, tunnel_id = %cf_client.tunnel_id, "tunnel deleted on cloudflare");
+                        recorder
+                            .publish(
+                                &Event {
+                                    type_: EventType::Normal,
+                                    reason: "Deleted".into(),
+                                    note: Some(format!(
+                                        "Tunnel {} deleted on Cloudflare",
+                                        cf_client.tunnel_id
+                                    )),
+                                    action: "Deleting".into(),
+                                    secondary: None,
+                                },
+                                &obj_ref,
+                            )
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        recorder
+                            .publish(
+                                &Event {
+                                    type_: EventType::Warning,
+                                    reason: "FailedDeleting".into(),
+                                    note: Some(format!("Failed to delete tunnel on Cloudflare: {e}")),
+                                    action: "Deleting".into(),
+                                    secondary: None,
+                                },
+                                &obj_ref,
+                            )
+                            .await
+                            .ok();
+                        return Err(e);
+                    }
+                }
 
                 // Remove finalizer
                 let patch = serde_json::json!({
@@ -252,6 +375,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
                     }
                 });
                 patch_tunnel(k8s, &name, &ns, T::is_cluster_scoped(), &patch).await?;
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Normal,
+                            reason: "FinalizerUnset".into(),
+                            note: Some("Finalizer removed".into()),
+                            action: "Deleting".into(),
+                            secondary: None,
+                        },
+                        &obj_ref,
+                    )
+                    .await
+                    .ok();
             }
             return Ok(Action::await_change());
         }
@@ -266,9 +402,41 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
                 .validate_account(&spec.cloudflare.account_id, &spec.cloudflare.account_name)
                 .await?;
 
-            let (tunnel_id, creds_json) = cf_client.create_tunnel(&cf_client.account_id.clone(), &tn).await?;
-            info!(name = %name, tunnel_id = %tunnel_id, "tunnel created on cloudflare");
-            tunnel_creds = creds_json;
+            match cf_client.create_tunnel(&cf_client.account_id.clone(), &tn).await {
+                Ok((tunnel_id, creds_json)) => {
+                    info!(name = %name, tunnel_id = %tunnel_id, "tunnel created on cloudflare");
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Normal,
+                                reason: "Created".into(),
+                                note: Some(format!("Tunnel {tunnel_id} created on Cloudflare")),
+                                action: "Creating".into(),
+                                secondary: None,
+                            },
+                            &obj_ref,
+                        )
+                        .await
+                        .ok();
+                    tunnel_creds = creds_json;
+                }
+                Err(e) => {
+                    recorder
+                        .publish(
+                            &Event {
+                                type_: EventType::Warning,
+                                reason: "FailedCreate".into(),
+                                note: Some(format!("Failed to create tunnel on Cloudflare: {e}")),
+                                action: "Creating".into(),
+                                secondary: None,
+                            },
+                            &obj_ref,
+                        )
+                        .await
+                        .ok();
+                    return Err(e);
+                }
+            }
         } else {
             // Tunnel already created, read creds from existing managed secret
             match secrets_api.get(&name).await {
@@ -302,6 +470,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
             });
             patch_tunnel(k8s, &name, &ns, T::is_cluster_scoped(), &patch).await?;
             info!(name = %name, "finalizer added");
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Normal,
+                        reason: "FinalizerSet".into(),
+                        note: Some("Finalizer added to tunnel".into()),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
         }
     }
 
@@ -333,8 +514,43 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
     let status_patch = serde_json::json!({
         "status": new_status
     });
-    patch_tunnel_status(k8s, &name, &ns, T::is_cluster_scoped(), &status_patch).await?;
-    info!(name = %name, tunnel_id = %cf_client.tunnel_id, "tunnel status updated");
+    match patch_tunnel_status(k8s, &name, &ns, T::is_cluster_scoped(), &status_patch).await {
+        Ok(()) => {
+            info!(name = %name, tunnel_id = %cf_client.tunnel_id, "tunnel status updated");
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Normal,
+                        reason: "StatusUpdated".into(),
+                        note: Some(format!(
+                            "Status updated: tunnel_id={}, zone_id={}",
+                            cf_client.tunnel_id, cf_client.zone_id
+                        )),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
+        }
+        Err(e) => {
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "FailedStatusSet".into(),
+                        note: Some(format!("Failed to update tunnel status: {e}")),
+                        action: "Reconciling".into(),
+                        secondary: None,
+                    },
+                    &obj_ref,
+                )
+                .await
+                .ok();
+            return Err(e);
+        }
+    }
 
     // 6. Create/update managed Secret with tunnel credentials
     if !tunnel_creds.is_empty() {
@@ -349,6 +565,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
             )
             .await?;
         info!(name = %name, "credentials secret applied");
+        recorder
+            .publish(
+                &Event {
+                    type_: EventType::Normal,
+                    reason: "SecretApplied".into(),
+                    note: Some("Tunnel credentials secret applied".into()),
+                    action: "Reconciling".into(),
+                    secondary: None,
+                },
+                &obj_ref,
+            )
+            .await
+            .ok();
     } else {
         warn!(name = %name, "empty tunnel credentials, skipping secret update");
     }
@@ -388,6 +617,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
         )
         .await?;
     info!(name = %name, "configmap applied");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "ConfigMapApplied".into(),
+                note: Some("Cloudflared configuration ConfigMap applied".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     // 8. Build and apply Deployment
     let config_hash = compute_md5(&applied_config_yaml);
@@ -415,6 +657,19 @@ pub async fn reconcile_tunnel<T: TunnelLike>(
         )
         .await?;
     info!(name = %name, "deployment applied");
+    recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: "DeploymentApplied".into(),
+                note: Some("Cloudflared Deployment applied".into()),
+                action: "Reconciling".into(),
+                secondary: None,
+            },
+            &obj_ref,
+        )
+        .await
+        .ok();
 
     // Apply deploy_patch as a second SSA pass with a different field manager
     let deploy_patch_str = &spec.deploy_patch;
