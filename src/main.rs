@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .for_each(|res| async move {
             match res {
                 Ok(o) => info!(tunnel = ?o, "tunnel reconciled"),
-                Err(e) => error!(error = %e, "tunnel reconcile failed"),
+                Err(e) => error!(error = ?e, "tunnel reconcile failed"),
             }
         });
 
@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .for_each(|res| async move {
             match res {
                 Ok(o) => info!(cluster_tunnel = ?o, "cluster tunnel reconciled"),
-                Err(e) => error!(error = %e, "cluster tunnel reconcile failed"),
+                Err(e) => error!(error = ?e, "cluster tunnel reconcile failed"),
             }
         });
 
@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         .for_each(|res| async move {
             match res {
                 Ok(o) => info!(binding = ?o, "tunnel binding reconciled"),
-                Err(e) => error!(error = %e, "tunnel binding reconcile failed"),
+                Err(e) => error!(error = ?e, "tunnel binding reconcile failed"),
             }
         });
 

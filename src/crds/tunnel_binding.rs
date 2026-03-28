@@ -81,7 +81,7 @@ impl Resource for TunnelBinding {
     }
 
     fn url_path(dt: &(), namespace: Option<&str>) -> String {
-        let prefix = "apis/networking.cfargotunnel.com/v1alpha1";
+        let prefix = "/apis/networking.cfargotunnel.com/v1alpha1";
         match namespace {
             Some(ns) => format!("{prefix}/namespaces/{ns}/{}", Self::plural(dt)),
             None => format!("{prefix}/{}", Self::plural(dt)),
